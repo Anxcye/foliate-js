@@ -3,8 +3,116 @@ import { createTOCView } from './ui/tree.js'
 import { createMenu } from './ui/menu.js'
 import { Overlayer } from './overlayer.js'
 const { configure, ZipReader, BlobReader, TextWriter, BlobWriter } =
-await import('./vendor/zip.js')
+    await import('./vendor/zip.js')
 const { EPUB } = await import('./epub.js')
+
+// https://github.com/johnfactotum/foliate
+const setSelectionHandler = (view, doc, index) => {
+    const debounce = (f, wait, immediate) => {
+        let timeout
+        return (...args) => {
+            const later = () => {
+                timeout = null
+                if (!immediate) f(...args)
+            }
+            const callNow = immediate && !timeout
+            if (timeout) clearTimeout(timeout)
+            timeout = setTimeout(later, wait)
+            if (callNow) f(...args)
+        }
+    }
+
+    const pointIsInView = ({ x, y }) =>
+        x > 0 && y > 0 && x < window.innerWidth && y < window.innerHeight;
+
+    const frameRect = (frame, rect, sx = 1, sy = 1) => {
+        const left = sx * rect.left + frame.left;
+        const right = sx * rect.right + frame.left;
+        const top = sy * rect.top + frame.top;
+        const bottom = sy * rect.bottom + frame.top;
+        return { left, right, top, bottom };
+    };
+
+    const getLang = el => {
+        const lang = el.lang || el?.getAttributeNS?.('http://www.w3.org/XML/1998/namespace', 'lang');
+        if (lang) return lang;
+        if (el.parentElement) return getLang(el.parentElement);
+    };
+
+    const getPosition = target => {
+        const frameElement = (target.getRootNode?.() ?? target?.endContainer?.getRootNode?.())
+            ?.defaultView?.frameElement;
+
+        const transform = frameElement ? getComputedStyle(frameElement).transform : '';
+        const match = transform.match(/matrix\((.+)\)/);
+        const [sx, , , sy] = match?.[1]?.split(/\s*,\s*/)?.map(x => parseFloat(x)) ?? [];
+
+        const frame = frameElement?.getBoundingClientRect() ?? { top: 0, left: 0 };
+        const rects = Array.from(target.getClientRects());
+        const first = frameRect(frame, rects[0], sx, sy);
+        const last = frameRect(frame, rects.at(-1), sx, sy);
+        const start = {
+            point: { x: (first.left + first.right) / 2, y: first.top },
+            dir: 'up',
+        };
+        const end = {
+            point: { x: (last.left + last.right) / 2, y: last.bottom },
+            dir: 'down',
+        };
+        const startInView = pointIsInView(start.point);
+        const endInView = pointIsInView(end.point);
+        if (!startInView && !endInView) return { point: { x: 0, y: 0 } };
+        if (!startInView) return end;
+        if (!endInView) return start;
+        return start.point.y > window.innerHeight - end.point.y ? start : end;
+    };
+
+    const getSelectionRange = sel => {
+        if (!sel.rangeCount) return;
+        const range = sel.getRangeAt(0);
+        if (range.collapsed) return;
+        return range;
+    };
+
+    let isSelecting = false;
+
+    doc.addEventListener('pointerdown', () => isSelecting = true);
+    doc.addEventListener('pointerup', () => {
+        isSelecting = false;
+        const sel = doc.getSelection();
+        const range = getSelectionRange(sel);
+        if (!range) return;
+        const pos = getPosition(range);
+        const cfi = view.getCFI(index, range);
+        const lang = getLang(range.commonAncestorContainer);
+        const text = sel.toString();
+        if (!text) {
+            const newSel = range.startContainer.ownerDocument.getSelection()
+            newSel.removeAllRanges()
+            newSel.addRange(range)
+            text = newSel.toString()
+        }
+        console.log({ index, range, lang, cfi, pos, text });
+    });
+
+    if (!view.isFixedLayout)
+        // go to the next page when selecting to the end of a page
+        // this makes it possible to select across pages
+        doc.addEventListener('selectionchange', debounce(() => {
+            if (!isSelecting) return
+            if (view.renderer.getAttribute('flow') !== 'paginated') return
+            const { lastLocation } = view
+            if (!lastLocation) return
+            const selRange = getSelectionRange(doc.getSelection())
+            if (!selRange) return
+            if (selRange.compareBoundaryPoints(Range.END_TO_END, lastLocation.range) >= 0) {
+                view.next()
+                console.log('next');
+
+            }
+        }, 1000))
+
+};
 
 const isZip = async file => {
     const arr = new Uint8Array(await file.slice(0, 4).arrayBuffer())
@@ -108,10 +216,17 @@ const getView = async file => {
     return view
 }
 
-const getCSS = ({ spacing, justify, hyphenate }) => `
+const getCSS = ({ fontSize,
+    spacing,
+    fontColor,
+    backgroundColor,
+    justify,
+    hyphenate }) => `
     @namespace epub "http://www.idpf.org/2007/ops";
     html {
-        color-scheme: light dark;
+        color: ${fontColor};
+        background-color: ${backgroundColor};
+        font-size: ${fontSize}em;
     }
     /* https://github.com/whatwg/html/issues/5426 */
     @media (prefers-color-scheme: dark) {
@@ -119,7 +234,7 @@ const getCSS = ({ spacing, justify, hyphenate }) => `
             color: lightblue;
         }
     }
-    p, li, blockquote, dd {
+    p, li, blockquote, dd, div{
         line-height: ${spacing};
         text-align: ${justify ? 'justify' : 'start'};
         -webkit-hyphens: ${hyphenate ? 'auto' : 'manual'};
@@ -150,162 +265,181 @@ const getCSS = ({ spacing, justify, hyphenate }) => `
 const $ = document.querySelector.bind(document)
 
 const locales = 'en'
-const percentFormat = new Intl.NumberFormat(locales, { style: 'percent' })
 
 class Reader {
-    #tocView
-    style = {
-        spacing: 1.4,
-        justify: true,
-        hyphenate: true,
-    }
     annotations = new Map()
-    annotationsByValue = new Map()
-    closeSideBar() {
-        $('#dimming-overlay').classList.remove('show')
-        $('#side-bar').classList.remove('show')
-    }
+    annotationsByCFI = new Map()
     constructor() {
-        $('#side-bar-button').addEventListener('click', () => {
-            $('#dimming-overlay').classList.add('show')
-            $('#side-bar').classList.add('show')
-        })
-        $('#dimming-overlay').addEventListener('click', () => this.closeSideBar())
 
-        const menu = createMenu([
-            {
-                name: 'layout',
-                label: 'Layout',
-                type: 'radio',
-                items: [
-                    ['Paginated', 'paginated'],
-                    ['Scrolled', 'scrolled'],
-                ],
-                onclick: value => {
-                    this.view?.renderer.setAttribute('flow', value)
-                },
-            },
-        ])
-        menu.element.classList.add('menu')
-
-        $('#menu-button').append(menu.element)
-        $('#menu-button > button').addEventListener('click', () =>
-            menu.element.classList.toggle('show'))
-        menu.groups.layout.select('paginated')
     }
-    async open(file) {
+    async open(file, cfi) {
         this.view = await getView(file)
+
+        await this.view.init({ lastLocation: cfi })
+
         this.view.addEventListener('load', this.#onLoad.bind(this))
         this.view.addEventListener('relocate', this.#onRelocate.bind(this))
 
         const { book } = this.view
-        this.view.renderer.setStyles?.(getCSS(this.style))
+
+
+        setStyle()
         this.view.renderer.next()
 
-        $('#header-bar').style.visibility = 'visible'
-        $('#nav-bar').style.visibility = 'visible'
-        $('#left-button').addEventListener('click', () => this.view.goLeft())
-        $('#right-button').addEventListener('click', () => this.view.goRight())
-
-        const slider = $('#progress-slider')
-        slider.dir = book.dir
-        slider.addEventListener('input', e =>
-            this.view.goToFraction(parseFloat(e.target.value)))
-        for (const fraction of this.view.getSectionFractions()) {
-            const option = document.createElement('option')
-            option.value = fraction
-            $('#tick-marks').append(option)
-        }
-
-        document.addEventListener('keydown', this.#handleKeydown.bind(this))
-
-        const title = book.metadata?.title ?? 'Untitled Book'
-        document.title = title
-        $('#side-bar-title').innerText = title
-        const author = book.metadata?.author
-        $('#side-bar-author').innerText = typeof author === 'string' ? author
-            : author
-                ?.map(author => typeof author === 'string' ? author : author.name)
-                ?.join(', ')
-                ?? ''
-        Promise.resolve(book.getCover?.())?.then(blob =>
-            blob ? $('#side-bar-cover').src = URL.createObjectURL(blob) : null)
-
-        const toc = book.toc
-        if (toc) {
-            this.#tocView = createTOCView(toc, href => {
-                this.view.goTo(href).catch(e => console.error(e))
-                this.closeSideBar()
-            })
-            $('#toc-view').append(this.#tocView.element)
-        }
-
-        // load and show highlights embedded in the file by Calibre
-        const bookmarks = await book.getCalibreBookmarks?.()
+        let bookmarks = [
+            { id: 1, type: 'highlight', cfi: "epubcfi(/6/8!/4/4,/1:0,/1:20)", color: 'blue', note: 'this is' },
+            { id: 2, type: 'highlight', cfi: "epubcfi(/6/8!/4/6,/1:0,/1:13)", color: 'yellow', note: 'this is' },
+            { id: 3, type: 'underline', cfi: "epubcfi(/6/8!/4/6,/1:76,/1:84)", color: 'red', note: 'this is' },
+            // { type: 'highlight', cfi" , spine_index: 0, style: { which: 'blue' }, notes: 'this is a note' },
+            // { type: 'highlight', cfi" , spine_index: 0, style: { which: 'red' }, notes: 'this is a note' },
+        ]
         if (bookmarks) {
-            const { fromCalibreHighlight } = await import('./epubcfi.js')
-            for (const obj of bookmarks) {
-                if (obj.type === 'highlight') {
-                    const value = fromCalibreHighlight(obj)
-                    const color = obj.style.which
-                    const note = obj.notes
-                    const annotation = { value, color, note }
-                    const list = this.annotations.get(obj.spine_index)
-                    if (list) list.push(annotation)
-                    else this.annotations.set(obj.spine_index, [annotation])
-                    this.annotationsByValue.set(value, annotation)
+            for (const bookmark of bookmarks) {
+                const { cfi, type, color, note } = bookmark
+                const annotation = { 
+                    id: bookmark.id,
+                    value: cfi,
+                    type,
+                    color,
+                    note
                 }
+                const spineCode = (cfi.split('/')[2].split('!')[0] - 2) / 2
+
+                const list = this.annotations.get(spineCode)
+                if (list) list.push(annotation)
+                else this.annotations.set(spineCode, [annotation])
+
+                this.annotationsByCFI.set(cfi, annotation)
             }
+
+
+
             this.view.addEventListener('create-overlay', e => {
+
                 const { index } = e.detail
                 const list = this.annotations.get(index)
                 if (list) for (const annotation of list)
                     this.view.addAnnotation(annotation)
             })
+
             this.view.addEventListener('draw-annotation', e => {
                 const { draw, annotation } = e.detail
-                const { color } = annotation
-                draw(Overlayer.highlight, { color })
+                const { color, type } = annotation
+                console.log(annotation);
+
+
+                if (type === 'highlight') draw(Overlayer.highlight, { color })
+                else if (type === 'underline') draw(Overlayer.underline, { color })
             })
+
             this.view.addEventListener('show-annotation', e => {
-                const annotation = this.annotationsByValue.get(e.detail.value)
-                if (annotation.note) alert(annotation.note)
+                console.log(e.detail);
+                const annotation = this.annotationsByCFI.get(e.detail.value)
+                console.log(annotation);
             })
         }
     }
-    #handleKeydown(event) {
-        const k = event.key
-        if (k === 'ArrowLeft' || k === 'h') this.view.goLeft()
-        else if(k === 'ArrowRight' || k === 'l') this.view.goRight()
+    #onLoad({ detail: { doc, index } }) {
+        setSelectionHandler(this.view, doc, index)
     }
-    #onLoad({ detail: { doc } }) {
-        doc.addEventListener('keydown', this.#handleKeydown.bind(this))
-    }
+
     #onRelocate({ detail }) {
-        const { fraction, location, tocItem, pageItem } = detail
-        const percent = percentFormat.format(fraction)
+        console.log(detail)
+        const { cfi, fraction, location, tocItem, pageItem } = detail
         const loc = pageItem
             ? `Page ${pageItem.label}`
             : `Loc ${location.current}`
-        const slider = $('#progress-slider')
-        slider.style.visibility = 'visible'
-        slider.value = fraction
-        slider.title = `${percent} · ${loc}`
-        if (tocItem?.href) this.#tocView?.setCurrentHref?.(tocItem.href)
+        globalThis.currentInfo = { cfi, fraction, loc, tocItem, pageItem }
     }
 }
 
-const open = async file => {
+const open = async (file, cfi) => {
     const reader = new Reader()
     globalThis.reader = reader
-    await reader.open(file)
+    await reader.open(file, cfi)
 }
 
-
-// const url = params.get('url')
-const url = './shiji.epub'
+const url = './jieyou.epub'
+const cfi = "epubcfi(/6/6!/4/22,/1:0,/1:42)"
+// const cfi = null
 if (url) fetch(url)
     .then(res => res.blob())
-    .then(blob => open(new File([blob], new URL(url, window.location.origin).pathname)))
+    .then(blob => open(new File([blob], new URL(url, window.location.origin).pathname), cfi))
     .catch(e => console.error(e))
-else dropTarget.style.visibility = 'visible'
+
+
+const getCurrentInfo = () => {
+    chatpterTitle = currentInfo.tocItem?.label
+    chapterTotalPages = 0
+    chapterCurrentPage = 0
+    bookTotalPages = currentInfo.pageItem?.total
+    bookCurrentPage = currentInfo.pageItem.current
+    cfi = currentInfo.cfi
+    percent = currentInfo.fraction
+
+    console.log({
+        chatpterTitle,
+        chapterTotalPages,
+        chapterCurrentPage,
+        bookTotalPages,
+        bookCurrentPage,
+        cfi,
+        percent
+    })
+
+}
+
+const getToc = () => {
+    reader.view.book.toc
+}
+
+const goToHref = href => {
+    reader.view.goTo(href)
+}
+
+const goToPercent = percent => {
+    reader.view.goToFraction(percent)
+}
+
+window.next = () => {
+    reader.view.next()
+}
+
+const prev = () => {
+    reader.view.prev()
+}
+
+const setScroll = (scroll) => {
+    reader.view.renderer.setAttribute('flow', scroll ? 'scrolled' : 'paginated')
+}
+
+let style = {
+    fontSize: 1.2,
+    spacing: '1.5',
+    fontColor: '#66ccff',
+    backgroundColor: '#000000',
+    topMargin: 100,
+    bottomMargin: 100,
+    sideMargin: 5,
+    justify: true,
+    hyphenate: true,
+    scroll: false
+}
+
+window.setStyle = () => {
+
+    reader.view.renderer.setAttribute('flow', style.scroll ? 'scrolled' : 'paginated')
+    reader.view.renderer.setAttribute('top-margin', `${style.topMargin}px`)
+    reader.view.renderer.setAttribute('bottom-margin', `${style.bottomMargin}px`)
+    reader.view.renderer.setAttribute('gap', `${style.sideMargin}%`)
+    const newStyle = {
+        fontSize: style.fontSize,
+        spacing: style.spacing,
+        fontColor: style.fontColor,
+        backgroundColor: style.backgroundColor,
+        justify: style.justify,
+        hyphenate: style.hyphenate
+    }
+    reader.view.renderer.setStyles?.(getCSS(newStyle))
+}
+

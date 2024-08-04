@@ -371,7 +371,7 @@ class View {
 // NOTE: everything here assumes the so-called "negative scroll type" for RTL
 export class Paginator extends HTMLElement {
     static observedAttributes = [
-        'flow', 'gap', 'margin',
+        'flow', 'gap', 'top-margin', 'bottom-margin',
         'max-inline-size', 'max-block-size', 'max-column-count',
     ]
     #root = this.attachShadow({ mode: 'closed' })
@@ -379,8 +379,8 @@ export class Paginator extends HTMLElement {
     #top
     #background
     #container
-    #header
-    #footer
+    // #header
+    // #footer
     #view
     #vertical = false
     #rtl = false
@@ -411,8 +411,9 @@ export class Paginator extends HTMLElement {
             height: 100%;
         }
         #top {
-            --_gap: 7%;
-            --_margin: 48px;
+            // --_gap: 7%;
+            --_top-margin: 0px;
+            --_bottom-margin: 0px;
             --_max-inline-size: 720px;
             --_max-block-size: 1440px;
             --_max-column-count: 2;
@@ -429,9 +430,9 @@ export class Paginator extends HTMLElement {
                 var(--_half-gap)
                 minmax(var(--_half-gap), 1fr);
             grid-template-rows:
-                minmax(var(--_margin), 1fr)
+                minmax(var(--_top-margin), 1fr)
                 minmax(0, var(--_max-height))
-                minmax(var(--_margin), 1fr);
+                minmax(var(--_bottom-margin), 1fr);
             &.vertical {
                 --_max-column-count-spread: var(--_max-column-count-portrait);
                 --_max-width: var(--_max-block-size);
@@ -451,7 +452,7 @@ export class Paginator extends HTMLElement {
             grid-row: 1 / -1;
         }
         #container {
-            grid-column: 2 / 5;
+            grid-column: 1 / -1;
             grid-row: 2;
             overflow: hidden;
         }
@@ -490,17 +491,15 @@ export class Paginator extends HTMLElement {
         </style>
         <div id="top">
             <div id="background" part="filter"></div>
-            <div id="header"></div>
             <div id="container"></div>
-            <div id="footer"></div>
         </div>
         `
 
         this.#top = this.#root.getElementById('top')
         this.#background = this.#root.getElementById('background')
         this.#container = this.#root.getElementById('container')
-        this.#header = this.#root.getElementById('header')
-        this.#footer = this.#root.getElementById('footer')
+        // this.#header = this.#root.getElementById('header')
+        // this.#footer = this.#root.getElementById('footer')
 
         this.#observer.observe(this.#container)
         this.#container.addEventListener('scroll', debounce(() => {
@@ -531,12 +530,13 @@ export class Paginator extends HTMLElement {
             case 'flow':
                 this.render()
                 break
-            case 'gap':
-            case 'margin':
+            case 'top-margin':
             case 'max-block-size':
             case 'max-column-count':
                 this.#top.style.setProperty('--_' + name, value)
                 break
+            case 'bottom-margin':
+            case 'gap':
             case 'max-inline-size':
                 // needs explicit `render()` as it doesn't necessarily resize
                 this.#top.style.setProperty('--_' + name, value)
@@ -575,7 +575,7 @@ export class Paginator extends HTMLElement {
         const style = getComputedStyle(this.#top)
         const maxInlineSize = parseFloat(style.getPropertyValue('--_max-inline-size'))
         const maxColumnCount = parseInt(style.getPropertyValue('--_max-column-count-spread'))
-        const margin = parseFloat(style.getPropertyValue('--_margin'))
+        const margin = parseFloat(style.getPropertyValue('--_top-margin'))
         this.#margin = margin
 
         const g = parseFloat(style.getPropertyValue('--_gap')) / 100
@@ -607,8 +607,8 @@ export class Paginator extends HTMLElement {
 
             this.heads = null
             this.feet = null
-            this.#header.replaceChildren()
-            this.#footer.replaceChildren()
+            // this.#header.replaceChildren()
+            // this.#footer.replaceChildren()
 
             return { flow, margin, gap, columnWidth }
         }
@@ -625,14 +625,14 @@ export class Paginator extends HTMLElement {
             gap: `${gap}px`,
             direction: this.bookDir === 'rtl' ? 'rtl' : 'ltr',
         }
-        Object.assign(this.#header.style, marginalStyle)
-        Object.assign(this.#footer.style, marginalStyle)
+        // Object.assign(this.#header.style, marginalStyle)
+        // Object.assign(this.#footer.style, marginalStyle)
         const heads = makeMarginals(marginalDivisor, 'head')
         const feet = makeMarginals(marginalDivisor, 'foot')
         this.heads = heads.map(el => el.children[0])
         this.feet = feet.map(el => el.children[0])
-        this.#header.replaceChildren(...heads)
-        this.#footer.replaceChildren(...feet)
+        // this.#header.replaceChildren(...heads)
+        // this.#footer.replaceChildren(...feet)
 
         return { height, width, margin, gap, columnWidth }
     }
@@ -852,7 +852,7 @@ export class Paginator extends HTMLElement {
         if (this.scrolled) detail.fraction = this.start / this.viewSize
         else if (this.pages > 0) {
             const { page, pages } = this
-            this.#header.style.visibility = page > 1 ? 'visible' : 'hidden'
+            // this.#header.style.visibility = page > 1 ? 'visible' : 'hidden'
             detail.fraction = (page - 1) / (pages - 2)
             detail.size = 1 / (pages - 2)
         }
@@ -889,7 +889,7 @@ export class Paginator extends HTMLElement {
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
-    async #goTo({ index, anchor, select}) {
+    async #goTo({ index, anchor, select }) {
         if (index === this.#index) await this.#display({ index, anchor, select })
         else {
             const oldIndex = this.#index
