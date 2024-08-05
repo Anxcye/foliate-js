@@ -374,7 +374,7 @@ export class Paginator extends HTMLElement {
         'flow', 'gap', 'top-margin', 'bottom-margin',
         'max-inline-size', 'max-block-size', 'max-column-count',
     ]
-    #root = this.attachShadow({ mode: 'closed' })
+    #root = this.attachShadow({ mode: 'open' })
     #observer = new ResizeObserver(() => this.render())
     #top
     #background

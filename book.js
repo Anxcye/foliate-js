@@ -1,6 +1,5 @@
 import './view.js'
-import { createTOCView } from './ui/tree.js'
-import { createMenu } from './ui/menu.js'
+import { FootnoteHandler } from './footnotes.js'
 import { Overlayer } from './overlayer.js'
 const { configure, ZipReader, BlobReader, TextWriter, BlobWriter } =
     await import('./vendor/zip.js')
@@ -92,7 +91,7 @@ const setSelectionHandler = (view, doc, index) => {
             newSel.addRange(range)
             text = newSel.toString()
         }
-        console.log({ index, range, lang, cfi, pos, text });
+        onSelectionEnd({ index, range, lang, cfi, pos, text });
     });
 
     if (!view.isFixedLayout)
@@ -107,8 +106,6 @@ const setSelectionHandler = (view, doc, index) => {
             if (!selRange) return
             if (selRange.compareBoundaryPoints(Range.END_TO_END, lastLocation.range) >= 0) {
                 view.next()
-                console.log('next');
-
             }
         }, 1000))
 
@@ -262,15 +259,64 @@ const getCSS = ({ fontSize,
     }
 `
 
-const $ = document.querySelector.bind(document)
-
-const locales = 'en'
+const footnoteDialog = document.getElementById('footnote-dialog')
+footnoteDialog.addEventListener('close', () => {
+    // emit({ type: 'dialog-close' })
+    const view = footnoteDialog.querySelector('foliate-view')
+    view.close()
+    view.remove()
+})
+footnoteDialog.addEventListener('click', e =>
+    e.target === footnoteDialog ? footnoteDialog.close() : null)
 
 class Reader {
     annotations = new Map()
-    annotationsByCFI = new Map()
+    annotationsByValue = new Map()
+    #footnoteHandler = new FootnoteHandler()
     constructor() {
+        this.#footnoteHandler.addEventListener('before-render', e => {
+            const { view } = e.detail
 
+            view.addEventListener('link', e => {
+                e.preventDefault()
+                const { href } = e.detail
+                this.view.goTo(href)
+            })
+            view.addEventListener('external-link', e => {
+                e.preventDefault()
+                // emit({ type: 'external-link', ...e.detail })
+            })
+
+            footnoteDialog.querySelector('main').replaceChildren(view)
+
+            const { renderer } = view
+            renderer.setAttribute('flow', 'scrolled')
+            renderer.setAttribute('gap', '5%')
+            const footNoteStyle = {
+                fontSize: style.fontSize * 0.8,
+                spacing: style.spacing,
+                fontColor: style.fontColor,
+                backgroundColor: style.backgroundColor + '00',
+                justify: true,
+                hyphenate: true,
+            }
+            renderer.setStyles(getCSS(footNoteStyle))
+            // set background color of dialog
+            footnoteDialog.style.backgroundColor = style.backgroundColor + 'dd'
+            // hide scorllbar of dialog
+            footnoteDialog.style.overflow = 'hidden'
+
+
+        })
+        this.#footnoteHandler.addEventListener('render', e => {
+            console.log(e.detail)
+            // const { href, hidden, type } = e.detail
+            const { view } = e.detail
+            console.log(view)
+
+
+            footnoteDialog.showModal()
+        })
     }
     async open(file, cfi) {
         this.view = await getView(file)
@@ -280,36 +326,27 @@ class Reader {
         this.view.addEventListener('load', this.#onLoad.bind(this))
         this.view.addEventListener('relocate', this.#onRelocate.bind(this))
 
-        const { book } = this.view
-
-
         setStyle()
         this.view.renderer.next()
 
-        let bookmarks = [
-            { id: 1, type: 'highlight', cfi: "epubcfi(/6/8!/4/4,/1:0,/1:20)", color: 'blue', note: 'this is' },
-            { id: 2, type: 'highlight', cfi: "epubcfi(/6/8!/4/6,/1:0,/1:13)", color: 'yellow', note: 'this is' },
-            { id: 3, type: 'underline', cfi: "epubcfi(/6/8!/4/6,/1:76,/1:84)", color: 'red', note: 'this is' },
-            // { type: 'highlight', cfi" , spine_index: 0, style: { which: 'blue' }, notes: 'this is a note' },
-            // { type: 'highlight', cfi" , spine_index: 0, style: { which: 'red' }, notes: 'this is a note' },
-        ]
+        const bookmarks = getAllAnnotations()
         if (bookmarks) {
             for (const bookmark of bookmarks) {
-                const { cfi, type, color, note } = bookmark
-                const annotation = { 
+                const { value, type, color, note } = bookmark
+                const annotation = {
                     id: bookmark.id,
-                    value: cfi,
+                    value,
                     type,
                     color,
                     note
                 }
-                const spineCode = (cfi.split('/')[2].split('!')[0] - 2) / 2
+                const spineCode = (value.split('/')[2].split('!')[0] - 2) / 2
 
                 const list = this.annotations.get(spineCode)
                 if (list) list.push(annotation)
                 else this.annotations.set(spineCode, [annotation])
 
-                this.annotationsByCFI.set(cfi, annotation)
+                this.annotationsByValue.set(value, annotation)
             }
 
 
@@ -334,11 +371,50 @@ class Reader {
 
             this.view.addEventListener('show-annotation', e => {
                 console.log(e.detail);
-                const annotation = this.annotationsByCFI.get(e.detail.value)
-                console.log(annotation);
+                const annotation = this.annotationsByValue.get(e.detail.value)
+                onAnnotationClick(annotation)
             })
         }
+        this.view.addEventListener('external-link', e => {
+            e.preventDefault()
+            onExternalLink(e.detail)
+        })
+
+        this.view.addEventListener('link', e =>
+            this.#footnoteHandler.handle(this.view.book, e)?.catch(err => {
+                console.warn(err)
+                this.view.goTo(e.detail.href)
+            }))
     }
+
+    addAnnotation(annotation) {
+        const { value } = annotation
+        const spineCode = (value.split('/')[2].split('!')[0] - 2) / 2
+
+        const list = this.annotations.get(spineCode)
+        if (list) list.push(annotation)
+        else this.annotations.set(spineCode, [annotation])
+
+        this.annotationsByValue.set(value, annotation)
+
+        this.view.addAnnotation(annotation)
+    }
+
+    removeAnnotation(annotation) {
+        const { value } = annotation
+        const spineCode = (value.split('/')[2].split('!')[0] - 2) / 2
+
+        const list = this.annotations.get(spineCode)
+        if (list) {
+            const index = list.findIndex(a => a.id === annotation.id)
+            if (index !== -1) list.splice(index, 1)
+        }
+
+        this.annotationsByValue.delete(value)
+
+        this.view.addAnnotation(annotation, true)
+    }
+
     #onLoad({ detail: { doc, index } }) {
         setSelectionHandler(this.view, doc, index)
     }
@@ -359,9 +435,9 @@ const open = async (file, cfi) => {
     await reader.open(file, cfi)
 }
 
-const url = './jieyou.epub'
-const cfi = "epubcfi(/6/6!/4/22,/1:0,/1:42)"
-// const cfi = null
+const url = './shiji.epub'
+// const cfi = "epubcfi(/6/6!/4/22,/1:0,/1:42)"
+const cfi = null
 if (url) fetch(url)
     .then(res => res.blob())
     .then(blob => open(new File([blob], new URL(url, window.location.origin).pathname), cfi))
@@ -389,41 +465,30 @@ const getCurrentInfo = () => {
 
 }
 
-const getToc = () => {
-    reader.view.book.toc
-}
+const getToc = () => reader.view.book.toc
 
-const goToHref = href => {
-    reader.view.goTo(href)
-}
+const goToHref = href => reader.view.goTo(href)
 
-const goToPercent = percent => {
-    reader.view.goToFraction(percent)
-}
+const goToPercent = percent => reader.view.goToFraction(percent)
 
-window.next = () => {
-    reader.view.next()
-}
+const next = () => reader.view.next()
 
-const prev = () => {
-    reader.view.prev()
-}
+const prev = () => reader.view.prev()
 
-const setScroll = (scroll) => {
-    reader.view.renderer.setAttribute('flow', scroll ? 'scrolled' : 'paginated')
-}
+const setScroll = (scroll) => reader.view.renderer.setAttribute('flow', scroll ? 'scrolled' : 'paginated')
 
 let style = {
     fontSize: 1.2,
     spacing: '1.5',
     fontColor: '#66ccff',
-    backgroundColor: '#000000',
+    backgroundColor: '#ffffff',
     topMargin: 100,
     bottomMargin: 100,
     sideMargin: 5,
     justify: true,
     hyphenate: true,
-    scroll: false
+    scroll: false,
+    animated: true
 }
 
 window.setStyle = () => {
@@ -432,6 +497,7 @@ window.setStyle = () => {
     reader.view.renderer.setAttribute('top-margin', `${style.topMargin}px`)
     reader.view.renderer.setAttribute('bottom-margin', `${style.bottomMargin}px`)
     reader.view.renderer.setAttribute('gap', `${style.sideMargin}%`)
+    reader.view.renderer.setAttribute('animated', style.animated)
     const newStyle = {
         fontSize: style.fontSize,
         spacing: style.spacing,
@@ -443,3 +509,25 @@ window.setStyle = () => {
     reader.view.renderer.setStyles?.(getCSS(newStyle))
 }
 
+const getAllAnnotations = () => {
+    return [
+        // { id: 1, type: 'highlight', value: "epubcfi(/6/8!/4/4,/1:0,/1:20)", color: 'blue', note: 'this is' },
+        // { id: 2, type: 'highlight', value: "epubcfi(/6/8!/4/6,/1:0,/1:13)", color: 'yellow', note: 'this is' },
+        // { id: 3, type: 'underline', value: "epubcfi(/6/8!/4/6,/1:76,/1:84)", color: 'red', note: 'this is' },
+    ]
+}
+
+const onAnnotationClick = (annotation) => console.log(annotation)
+
+const onSelectionEnd = (selection) => console.log(selection);
+
+const clearSelection = () => reader.view.deselect()
+
+const addAnnotation = (annotation) => reader.addAnnotation(annotation)
+
+const updateAnnotation = (annotation, remove) => remove ? reader.removeAnnotation(annotation) : reader.addAnnotation(annotation)
+
+const onExternalLink = (link) => console.log(link)
+
+const prevSection = () => reader.view.renderer.prevSection()
+const nextSection = () => reader.view.renderer.nextSection()
